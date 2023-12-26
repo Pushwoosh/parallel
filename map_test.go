@@ -1,11 +1,11 @@
-package parallel
+package parallel_test
 
 import (
 	"errors"
 	"sync"
 	"testing"
 
-	"gitlab.corp.pushwoosh.com/uds/pkg/parallel"
+	"github.com/pushwoosh/parallel"
 )
 
 func Test_MapChan(t *testing.T) {
