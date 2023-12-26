@@ -94,3 +94,16 @@ parallel.Execute(
 ```
 
 # ConcurrencyLimiter
+ConcurrencyLimiter is a helper that can limit amount of concurrently processed requests.
+
+## Example
+```go
+limiter := NewConcurrencyLimiter(ops.concurrency)
+for i := 0; i < 10000; i++ {
+    limiter.Acquire()
+    go func(i int) {
+        defer limiter.Release()
+        longJob(i)
+    }(i)
+}
+```
