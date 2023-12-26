@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Pushwoosh/parallel"
+	"github.com/pushwoosh/parallel"
 )
 
 func main() {

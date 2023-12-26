@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/Pushwoosh/parallel"
+	"github.com/pushwoosh/parallel"
 )
 
 func main() {
