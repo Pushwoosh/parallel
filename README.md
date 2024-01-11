@@ -3,7 +3,7 @@ Parallel is a go library containing helper functions for parallel processing.
 
 # Installation
 ```bash
-go get github.com/Pushwoosh/parallel
+go get github.com/pushwoosh/parallel
 ```
 
 # Examples
