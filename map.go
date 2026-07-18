@@ -2,6 +2,7 @@ package parallel
 
 import (
 	"errors"
+	"runtime/debug"
 	"sync"
 )
 
@@ -11,6 +12,10 @@ const mapOutputBufferSize = 1000
 var ErrMapSkip = errors.New("skip")
 
 // MapChan executes `fn` on each element of `input` channel in several threads.
+//
+// A panic in `fn` does not kill the process: it is recovered in the worker
+// and delivered to the returned errors channel as *PanicError. MapChan is
+// non-blocking, so the panic can not be re-raised in the calling goroutine.
 func MapChan[Input any, Output any](input <-chan Input, fn func(in Input) (Output, error), opts ...MapOption) (<-chan Output, <-chan error) {
 	ops := parseMapOptions(opts)
 
@@ -36,6 +41,11 @@ func MapChan[Input any, Output any](input <-chan Input, fn func(in Input) (Outpu
 					limiter.Release()
 					wg.Done()
 				}()
+				defer func() {
+					if r := recover(); r != nil {
+						errs <- &PanicError{Value: r, Stack: debug.Stack()}
+					}
+				}()
 
 				res, err := fn(item)
 				if err != nil {
@@ -59,6 +69,10 @@ func MapChan[Input any, Output any](input <-chan Input, fn func(in Input) (Outpu
 }
 
 // MapSlice does the same as MapChan, but works with slices instead of channels in input and output.
+//
+// Unlike MapChan, MapSlice blocks until all workers finish, so the first
+// panic recovered in a worker is re-raised in the calling goroutine
+// as *PanicError.
 func MapSlice[Input any, Output any](input []Input, fn func(in Input) (Output, error), opts ...MapOption) ([]Output, []error) {
 	// convert slice to channel
 	inputChan := make(chan Input, len(input))
@@ -95,6 +109,14 @@ func MapSlice[Input any, Output any](input []Input, fn func(in Input) (Output, e
 		}
 	}
 
+	// re-raise the first worker panic in the calling goroutine
+	for _, err := range errs {
+		var panicErr *PanicError
+		if errors.As(err, &panicErr) {
+			panic(panicErr)
+		}
+	}
+
 	return output, errs
 }
 
@@ -103,6 +125,7 @@ func MapSliceOrdered[Input any, Output any](input []Input, fn func(in Input) (Ou
 	ops := parseMapOptions(opts)
 
 	wg := sync.WaitGroup{}
+	catcher := panicCatcher{}
 
 	limiter := NewConcurrencyLimiter(ops.concurrency)
 
@@ -118,22 +141,25 @@ func MapSliceOrdered[Input any, Output any](input []Input, fn func(in Input) (Ou
 				wg.Done()
 			}()
 
-			res, err := fn(input[i])
+			catcher.call(func() {
+				res, err := fn(input[i])
 
-			// We do not care if some inner function returns ErrMapSkip.
-			// Only direct error from `fn` callback is important. So no errors.Is here
-			//goland:noinspection GoDirectComparisonOfErrors
-			if err != ErrMapSkip {
-				errs[i] = err
-			}
+				// We do not care if some inner function returns ErrMapSkip.
+				// Only direct error from `fn` callback is important. So no errors.Is here
+				//goland:noinspection GoDirectComparisonOfErrors
+				if err != ErrMapSkip {
+					errs[i] = err
+				}
 
-			if err == nil {
-				output[i] = res
-			}
+				if err == nil {
+					output[i] = res
+				}
+			})
 		}(i)
 	}
 
 	wg.Wait()
+	catcher.repanic()
 
 	return output, errs
 }

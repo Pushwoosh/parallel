@@ -5,9 +5,14 @@ import (
 )
 
 // Execute executes multiple callback functions `cbs` in parallel.
+//
+// A panic in a callback does not kill the process: it is recovered in the
+// worker, remaining callbacks are still executed, and the first panic is
+// re-raised in the calling goroutine as *PanicError after all workers finish.
 func Execute(cbs ...func() error) []error {
 	var errs []error
 	wg := sync.WaitGroup{}
+	catcher := panicCatcher{}
 
 	for i := range cbs {
 		wg.Add(1)
@@ -15,13 +20,16 @@ func Execute(cbs ...func() error) []error {
 			defer func() {
 				wg.Done()
 			}()
-			if err := cbs[idx](); err != nil {
-				errs = append(errs, err)
-			}
+			catcher.call(func() {
+				if err := cbs[idx](); err != nil {
+					errs = append(errs, err)
+				}
+			})
 		}(i)
 	}
 
 	wg.Wait()
+	catcher.repanic()
 
 	return errs
 }
@@ -32,6 +40,7 @@ func ExecuteOpts(cbs []func() error, opts ...ExecuteOption) []error {
 	ops := parseExecuteOptions(opts)
 
 	wg := sync.WaitGroup{}
+	catcher := panicCatcher{}
 
 	// init goroutines limiter
 	limiter := NewConcurrencyLimiter(ops.concurrency)
@@ -44,13 +53,16 @@ func ExecuteOpts(cbs []func() error, opts ...ExecuteOption) []error {
 				limiter.Release()
 				wg.Done()
 			}()
-			if err := cbs[idx](); err != nil {
-				errs = append(errs, err)
-			}
+			catcher.call(func() {
+				if err := cbs[idx](); err != nil {
+					errs = append(errs, err)
+				}
+			})
 		}(i)
 	}
 
 	wg.Wait()
+	catcher.repanic()
 
 	return errs
 }
