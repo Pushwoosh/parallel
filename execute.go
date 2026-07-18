@@ -11,6 +11,7 @@ import (
 // re-raised in the calling goroutine as *PanicError after all workers finish.
 func Execute(cbs ...func() error) []error {
 	var errs []error
+	var errsMu sync.Mutex
 	wg := sync.WaitGroup{}
 	catcher := panicCatcher{}
 
@@ -22,7 +23,9 @@ func Execute(cbs ...func() error) []error {
 			}()
 			catcher.call(func() {
 				if err := cbs[idx](); err != nil {
+					errsMu.Lock()
 					errs = append(errs, err)
+					errsMu.Unlock()
 				}
 			})
 		}(i)
@@ -37,6 +40,7 @@ func Execute(cbs ...func() error) []error {
 // ExecuteOpts executes slice of callback functions `cbs` with custom options.
 func ExecuteOpts(cbs []func() error, opts ...ExecuteOption) []error {
 	var errs []error
+	var errsMu sync.Mutex
 	ops := parseExecuteOptions(opts)
 
 	wg := sync.WaitGroup{}
@@ -55,7 +59,9 @@ func ExecuteOpts(cbs []func() error, opts ...ExecuteOption) []error {
 			}()
 			catcher.call(func() {
 				if err := cbs[idx](); err != nil {
+					errsMu.Lock()
 					errs = append(errs, err)
+					errsMu.Unlock()
 				}
 			})
 		}(i)
