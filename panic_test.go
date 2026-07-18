@@ -58,9 +58,22 @@ func Test_ApplySlice_PanicPropagates(t *testing.T) {
 	if len(panicErr.Stack) == 0 {
 		t.Fatal("expected non-empty worker stack trace")
 	}
-	// all workers must have finished before the panic is re-raised
-	if got := atomic.LoadInt64(&processed); got != totalNumbers-1 {
-		t.Fatalf("expected %d processed items, got %d", totalNumbers-1, got)
+	// after the first panic no new items are started, so the count is not
+	// deterministic — but the panicking item must never be counted
+	if got := atomic.LoadInt64(&processed); got > totalNumbers-1 {
+		t.Fatalf("expected at most %d processed items, got %d", totalNumbers-1, got)
+	}
+}
+
+func Test_ApplySlice_PanicNil(t *testing.T) {
+	panicErr := recoverPanicError(t, func() {
+		parallel.ApplySlice([]int{1}, func(i int) {
+			panic(nil) //nolint:govet
+		})
+	})
+
+	if panicErr.Value != nil {
+		t.Fatalf("expected nil panic value, got %v", panicErr.Value)
 	}
 }
 
@@ -86,8 +99,38 @@ func Test_ApplyChan_PanicPropagates(t *testing.T) {
 	if panicErr.Value != "string panic" {
 		t.Fatalf("expected panic value %q, got %v", "string panic", panicErr.Value)
 	}
-	if got := atomic.LoadInt64(&processed); got != totalNumbers-1 {
-		t.Fatalf("expected %d processed items, got %d", totalNumbers-1, got)
+	if got := atomic.LoadInt64(&processed); got > totalNumbers-1 {
+		t.Fatalf("expected at most %d processed items, got %d", totalNumbers-1, got)
+	}
+}
+
+func Test_ApplyChan_PanicSurfacesWithoutClosingInput(t *testing.T) {
+	input := make(chan int)
+	stop := make(chan struct{})
+	defer close(stop)
+
+	// the producer never closes `input`; ApplyChan must still re-raise the
+	// panic by stopping to read new items
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case input <- i:
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	panicErr := recoverPanicError(t, func() {
+		parallel.ApplyChan(input, func(i int) {
+			if i == 13 {
+				panic(errBoom)
+			}
+		})
+	})
+
+	if !errors.Is(panicErr, errBoom) {
+		t.Fatalf("expected panic value to unwrap to errBoom, got %v", panicErr.Value)
 	}
 }
 
@@ -130,8 +173,26 @@ func Test_ExecuteOpts_PanicPropagates(t *testing.T) {
 	if !errors.Is(panicErr, errBoom) {
 		t.Fatalf("expected panic value to unwrap to errBoom, got %v", panicErr.Value)
 	}
-	if got := atomic.LoadInt64(&processed); got != 99 {
-		t.Fatalf("expected 99 processed callbacks, got %d", got)
+	// after the first panic no new callbacks are started
+	if got := atomic.LoadInt64(&processed); got > 99 {
+		t.Fatalf("expected at most 99 processed callbacks, got %d", got)
+	}
+}
+
+func Test_MapSlice_ReturnedPanicErrorIsNotRepanicked(t *testing.T) {
+	// a callback that RETURNS a *PanicError (e.g. forwarded from a nested
+	// parallel call) must be treated as a regular error, not re-panicked
+	forwarded := &parallel.PanicError{Value: "not a panic in this call"}
+
+	output, errs := parallel.MapSlice([]int{1}, func(i int) (int, error) {
+		return 0, forwarded
+	})
+
+	if len(output) != 0 {
+		t.Fatalf("expected no output, got %v", output)
+	}
+	if len(errs) != 1 || !errors.Is(errs[0], forwarded) {
+		t.Fatalf("expected the returned *PanicError as a regular error, got %v", errs)
 	}
 }
 

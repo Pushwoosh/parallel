@@ -16,11 +16,15 @@ import (
 //
 //   - blocking functions (ApplyChan, ApplySlice, Execute, ExecuteOpts,
 //     MapSlice, MapSliceOrdered) re-raise the first recovered panic in the
-//     calling goroutine after all workers finish, so the caller's own
+//     calling goroutine after the workers finish, so the caller's own
 //     defer/recover (e.g. a gRPC recovery interceptor) can handle it just
-//     like a panic in synchronous code;
+//     like a panic in synchronous code. After the first panic no new items
+//     or callbacks are started; workers that are already running finish
+//     first. ApplyChan also stops reading from its input channel, so the
+//     panic is re-raised even if the channel is never closed;
 //   - MapChan is non-blocking, so recovered panics are delivered to the
-//     returned errors channel as *PanicError values.
+//     returned errors channel as *PanicError values and processing
+//     continues.
 //
 // Value holds the original value passed to panic(), Stack holds the stack
 // trace of the worker goroutine captured at the moment of recovery.
@@ -44,29 +48,61 @@ func (e *PanicError) Unwrap() error {
 
 // panicCatcher records the first panic recovered in worker goroutines.
 type panicCatcher struct {
-	once sync.Once
-	err  *PanicError
+	mu sync.Mutex
+	// err is the first recorded panic
+	err *PanicError
+	// done is closed when the first panic is recorded, so dispatch loops
+	// blocked on a channel receive can stop waiting for further input
+	done chan struct{}
+}
+
+func newPanicCatcher() *panicCatcher {
+	return &panicCatcher{done: make(chan struct{})}
+}
+
+// record keeps the first recorded panic and signals done.
+func (c *panicCatcher) record(err *PanicError) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err == nil {
+		c.err = err
+		close(c.done)
+	}
 }
 
 // call runs fn, recovering a panic and recording the first one.
+//
+// Completion is tracked with a flag instead of checking recover()'s result:
+// under the module's `go 1.18` semantics recover() returns nil after
+// panic(nil), which would otherwise make such a panic vanish. A worker that
+// exits via runtime.Goexit is treated the same as panic(nil).
 func (c *panicCatcher) call(fn func()) {
+	completed := false
 	defer func() {
-		if r := recover(); r != nil {
-			err := &PanicError{Value: r, Stack: debug.Stack()}
-			c.once.Do(func() {
-				c.err = err
-			})
+		if !completed {
+			c.record(&PanicError{Value: recover(), Stack: debug.Stack()})
 		}
 	}()
 
 	fn()
+	completed = true
+}
+
+// caught reports whether a panic has been recorded.
+func (c *panicCatcher) caught() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err != nil
 }
 
 // repanic re-raises the first recorded panic in the current goroutine.
-// Must be called after all workers have finished (i.e. after wg.Wait()),
-// which also guarantees visibility of c.err without extra synchronization.
+// Call it after all workers have finished (i.e. after wg.Wait()).
 func (c *panicCatcher) repanic() {
-	if c.err != nil {
-		panic(c.err)
+	c.mu.Lock()
+	err := c.err
+	c.mu.Unlock()
+
+	if err != nil {
+		panic(err)
 	}
 }

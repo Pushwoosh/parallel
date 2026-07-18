@@ -17,6 +17,14 @@ var ErrMapSkip = errors.New("skip")
 // and delivered to the returned errors channel as *PanicError. MapChan is
 // non-blocking, so the panic can not be re-raised in the calling goroutine.
 func MapChan[Input any, Output any](input <-chan Input, fn func(in Input) (Output, error), opts ...MapOption) (<-chan Output, <-chan error) {
+	return mapChan(input, fn, nil, opts)
+}
+
+// mapChan implements MapChan and MapSlice. If `catcher` is nil, recovered
+// worker panics are delivered to the returned errors channel; otherwise they
+// are recorded in `catcher` (for the caller to re-raise) and no new items
+// are dispatched after the first one.
+func mapChan[Input any, Output any](input <-chan Input, fn func(in Input) (Output, error), catcher *panicCatcher, opts []MapOption) (<-chan Output, <-chan error) {
 	ops := parseMapOptions(opts)
 
 	wg := sync.WaitGroup{}
@@ -34,6 +42,9 @@ func MapChan[Input any, Output any](input <-chan Input, fn func(in Input) (Outpu
 
 		// run callback for each input item
 		for item := range input {
+			if catcher != nil && catcher.caught() {
+				break
+			}
 			limiter.Acquire()
 			wg.Add(1)
 			go func(item Input) {
@@ -41,13 +52,17 @@ func MapChan[Input any, Output any](input <-chan Input, fn func(in Input) (Outpu
 					limiter.Release()
 					wg.Done()
 				}()
-				defer func() {
-					if r := recover(); r != nil {
-						errs <- &PanicError{Value: r, Stack: debug.Stack()}
-					}
-				}()
 
-				res, err := fn(item)
+				res, err, panicErr := protectedCall(fn, item)
+				if panicErr != nil {
+					if catcher != nil {
+						catcher.record(panicErr)
+					} else {
+						errs <- panicErr
+					}
+					return
+				}
+
 				if err != nil {
 					// We do not care if some inner function returns ErrMapSkip.
 					// Only direct error from `fn` callback is important. So no errors.Is here
@@ -68,15 +83,33 @@ func MapChan[Input any, Output any](input <-chan Input, fn func(in Input) (Outpu
 	return output, errs
 }
 
+// protectedCall invokes fn(item), converting a panic into *PanicError.
+// Completion is tracked with a flag instead of checking recover()'s result,
+// so panic(nil) is detected too (see panicCatcher.call).
+func protectedCall[Input any, Output any](fn func(in Input) (Output, error), item Input) (res Output, err error, panicErr *PanicError) {
+	completed := false
+	defer func() {
+		if !completed {
+			panicErr = &PanicError{Value: recover(), Stack: debug.Stack()}
+		}
+	}()
+
+	res, err = fn(item)
+	completed = true
+	return
+}
+
 // MapSlice does the same as MapChan, but works with slices instead of channels in input and output.
 //
-// Unlike MapChan, MapSlice blocks until all workers finish, so the first
+// Unlike MapChan, MapSlice blocks until the workers finish, so the first
 // panic recovered in a worker is re-raised in the calling goroutine
-// as *PanicError.
+// as *PanicError. After the first panic no new items are started.
 func MapSlice[Input any, Output any](input []Input, fn func(in Input) (Output, error), opts ...MapOption) ([]Output, []error) {
+	catcher := newPanicCatcher()
+
 	// convert slice to channel
 	inputChan := make(chan Input, len(input))
-	outputChan, errsChan := MapChan(inputChan, fn, opts...)
+	outputChan, errsChan := mapChan(inputChan, fn, catcher, opts)
 
 	go func() {
 		for _, item := range input {
@@ -109,13 +142,8 @@ func MapSlice[Input any, Output any](input []Input, fn func(in Input) (Output, e
 		}
 	}
 
-	// re-raise the first worker panic in the calling goroutine
-	for _, err := range errs {
-		var panicErr *PanicError
-		if errors.As(err, &panicErr) {
-			panic(panicErr)
-		}
-	}
+	// both channels are closed, so all workers have finished
+	catcher.repanic()
 
 	return output, errs
 }
@@ -125,7 +153,7 @@ func MapSliceOrdered[Input any, Output any](input []Input, fn func(in Input) (Ou
 	ops := parseMapOptions(opts)
 
 	wg := sync.WaitGroup{}
-	catcher := panicCatcher{}
+	catcher := newPanicCatcher()
 
 	limiter := NewConcurrencyLimiter(ops.concurrency)
 
@@ -133,6 +161,9 @@ func MapSliceOrdered[Input any, Output any](input []Input, fn func(in Input) (Ou
 	errs := make([]error, len(input))
 
 	for i := range input {
+		if catcher.caught() {
+			break
+		}
 		limiter.Acquire()
 		wg.Add(1)
 		go func(i int) {
