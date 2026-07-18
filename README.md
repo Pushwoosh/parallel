@@ -9,6 +9,25 @@ go get github.com/pushwoosh/parallel
 # Examples
 See [examples](examples) directory for full examples.
 
+# Panic handling
+A panic inside a callback happens in a worker goroutine spawned by this library.
+The caller can not recover it with its own `defer`/`recover` (recover only works
+inside the panicking goroutine), and an unrecovered panic in any goroutine kills
+the whole process. To prevent that, every worker recovers panics and the library
+propagates them to the caller:
+
+- Blocking functions (`ApplyChan`, `ApplySlice`, `Execute`, `ExecuteOpts`,
+  `MapSlice`, `MapSliceOrdered`) re-raise the first recovered panic in the
+  **calling** goroutine as `*parallel.PanicError` after all workers finish.
+  For the caller it looks exactly like a panic in synchronous code, so an
+  existing recovery layer (e.g. a gRPC recovery interceptor) handles it.
+- `MapChan` is non-blocking, so recovered panics are delivered to the returned
+  errors channel as `*parallel.PanicError` values.
+
+`PanicError` keeps the original panic value (`Value`) and the stack trace of the
+worker goroutine (`Stack`). If the panic value is an `error`, `PanicError`
+unwraps to it, so `errors.Is`/`errors.As` work through it.
+
 # Apply
 Apply executes given function on each element of the input slice or channel.
 
